@@ -7,6 +7,7 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.math.BigInteger;
 import java.security.AlgorithmParameters;
+import java.security.InvalidKeyException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -31,8 +32,10 @@ import java.security.spec.RSAPublicKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.HashSet;
 
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.NoSuchPaddingException;
+import javax.crypto.ShortBufferException;
 import javax.crypto.spec.OAEPParameterSpec;
 import javax.crypto.spec.PSource;
 
@@ -52,6 +55,7 @@ import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.asn1.x509.X509ObjectIdentifiers;
 import org.bouncycastle.jcajce.spec.OpenSSHPrivateKeySpec;
 import org.bouncycastle.jcajce.spec.OpenSSHPublicKeySpec;
+import org.bouncycastle.jcajce.spec.TLSRSAPremasterSecretParameterSpec;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.encoders.Base64;
@@ -752,6 +756,7 @@ public class RSATest
         oaepDigestCheck("SHA3-512", NISTObjectIdentifiers.id_sha3_512, pub2048Key, priv2048Key, rand, Hex.decode("7b7870bb5ae52276a8b06b59f7321043afb1fa4e5dbca9f14bcce9efaacded531f090646ab0f8701b012cc93c51e0a8591043e6457cde1950f4ffc8ad87d946622ea48a70f95f40c22d88679eb92c10c19db487fd64857d723daf4ccfe749fdd05e6c0be28de57e09d3b5a0981322b6cc7a9743a50eec355a7af5bdcdcddc5e279ad90f599b68c47fdb39916c7a597cf989169e8667fd8602e88c9c128085d0e158ea75eeb37919a91cdf3f2cd5394adaadc4a2f25a6222d2637cb464841dc5820e54843495cb97af6b19edc72f137123813f5d78503232f79e4f617be3a9f09b0206634a2ecfe457dbd71d2d3d8e3dbca486e75e543f559dcea3112ad50a21d"));
 
         testPSSKeys();
+        testTLSRSAPremasterSecret();
     }
 
     private void testPSSKeys()
@@ -895,6 +900,117 @@ public class RSATest
         byte[] decrypted  = rsaCipher.doFinal(encrypted);
 
         isTrue("zero mismatch", Arrays.areEqual(plain, decrypted));
+    }
+
+    /*
+     * CVE-2024-30171 (Marvin): in TLS mode RSA decryption of the premaster secret must never signal a
+     * padding or version failure, it must return a random 48 byte premaster secret instead.
+     */
+    private void testTLSRSAPremasterSecret()
+        throws Exception
+    {
+        KeyFactory fact = KeyFactory.getInstance("RSA", "BC");
+        PrivateKey privKey = fact.generatePrivate(priv2048KeySpec);
+        PublicKey pubKey = fact.generatePublic(pub2048KeySpec);
+        SecureRandom random = new SecureRandom();
+
+        int protocolVersion = 0x0303;
+        byte[] preMasterSecret = new byte[48];
+        random.nextBytes(preMasterSecret);
+        preMasterSecret[0] = (byte)(protocolVersion >>> 8);
+        preMasterSecret[1] = (byte)protocolVersion;
+
+        Cipher c = Cipher.getInstance("RSA/NONE/PKCS1Padding", "BC");
+        c.init(Cipher.ENCRYPT_MODE, pubKey, random);
+
+        byte[] encrypted = c.doFinal(preMasterSecret);
+
+        byte[] corrupted = Arrays.clone(encrypted);
+        corrupted[corrupted.length / 2] ^= 0x01;
+
+        byte[] outOfRange = new byte[encrypted.length];
+        Arrays.fill(outOfRange, (byte)0xFF);
+
+        String[] transformations = { "RSA/NONE/PKCS1Padding", "RSA/ECB/PKCS1Padding", "RSA/NONE/NoPadding" };
+
+        for (int i = 0; i != transformations.length; i++)
+        {
+            String name = transformations[i];
+            Cipher tls = Cipher.getInstance(name, "BC");
+
+            tls.init(Cipher.DECRYPT_MODE, privKey, new TLSRSAPremasterSecretParameterSpec(protocolVersion), random);
+
+            isEquals(name + " TLS output size wrong", 48, tls.getOutputSize(encrypted.length));
+
+            byte[] pms = tls.doFinal(encrypted);
+            isTrue(name + " TLS premaster secret decryption failed", Arrays.areEqual(preMasterSecret, pms));
+
+            byte[] out = new byte[48 + 5];
+            int len = tls.doFinal(encrypted, 0, encrypted.length, out, 5);
+            isEquals(name + " TLS output length wrong", 48, len);
+            isTrue(name + " TLS premaster secret decryption failed (offset)",
+                Arrays.areEqual(preMasterSecret, Arrays.copyOfRange(out, 5, 5 + 48)));
+
+            tls.update(encrypted, 0, 10);
+            pms = tls.doFinal(encrypted, 10, encrypted.length - 10);
+            isTrue(name + " TLS premaster secret decryption failed (update)", Arrays.areEqual(preMasterSecret, pms));
+
+            try
+            {
+                tls.doFinal(encrypted, 0, encrypted.length, new byte[47], 0);
+                fail(name + " TLS short output buffer accepted");
+            }
+            catch (ShortBufferException e)
+            {
+                // expected
+            }
+
+            // invalid padding must not be reported
+            pms = tls.doFinal(corrupted);
+            isEquals(name + " TLS corrupted output length wrong", 48, pms.length);
+            isTrue(name + " TLS corrupted ciphertext not rejected", !Arrays.areEqual(preMasterSecret, pms));
+
+            pms = tls.doFinal(outOfRange);
+            isEquals(name + " TLS out of range output length wrong", 48, pms.length);
+
+            // version mismatch must not be reported
+            tls.init(Cipher.DECRYPT_MODE, privKey, new TLSRSAPremasterSecretParameterSpec(0x0302), random);
+
+            pms = tls.doFinal(encrypted);
+            isEquals(name + " TLS version mismatch output length wrong", 48, pms.length);
+            isTrue(name + " TLS version mismatch not rejected", !Arrays.areEqual(preMasterSecret, pms));
+
+            // TLS mode requires a private key
+            try
+            {
+                tls.init(Cipher.DECRYPT_MODE, pubKey, new TLSRSAPremasterSecretParameterSpec(protocolVersion));
+                fail(name + " TLS public key accepted");
+            }
+            catch (InvalidKeyException e)
+            {
+                isEquals("RSA private key required for TLS decryption", e.getMessage());
+            }
+
+            // a regular init leaves TLS mode
+            tls.init(Cipher.DECRYPT_MODE, privKey);
+
+            isTrue(name + " TLS mode not reset", 48 != tls.getOutputSize(encrypted.length));
+        }
+
+        c.init(Cipher.DECRYPT_MODE, privKey, new TLSRSAPremasterSecretParameterSpec(protocolVersion));
+        c.init(Cipher.DECRYPT_MODE, privKey);
+
+        isTrue("PKCS1 decryption failed after TLS mode", Arrays.areEqual(preMasterSecret, c.doFinal(encrypted)));
+
+        try
+        {
+            c.doFinal(corrupted);
+            fail("PKCS1 corrupted ciphertext accepted");
+        }
+        catch (BadPaddingException e)
+        {
+            isEquals("unable to decrypt block", e.getMessage());
+        }
     }
 
     private void oaepCompatibilityTest(String digest, PrivateKey privKey, PublicKey pubKey)

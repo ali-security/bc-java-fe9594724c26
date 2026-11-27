@@ -17,6 +17,7 @@ import org.bouncycastle.crypto.params.ParametersWithRandom;
 import org.bouncycastle.crypto.params.RSAKeyGenerationParameters;
 import org.bouncycastle.crypto.params.RSAKeyParameters;
 import org.bouncycastle.crypto.params.RSAPrivateCrtKeyParameters;
+import org.bouncycastle.crypto.tls.TlsRsaKeyExchange;
 import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.encoders.Hex;
 import org.bouncycastle.util.test.SimpleTest;
@@ -418,7 +419,262 @@ public class RSATest
         }
     }
 
+    /*
+     * Build a PKCS#1 v1.5 type 2 (encryption) block of blockSize bytes (the leading zero byte omitted)
+     * containing the given plaintext, using non-zero padding bytes.
+     */
+    private static byte[] createType2Block(int blockSize, byte[] plaintext)
+    {
+        byte[] block = new byte[blockSize];
+        int sepPos = blockSize - plaintext.length - 1;
+
+        block[0] = 0x02;
+        for (int i = 1; i < sepPos; i++)
+        {
+            block[i] = (byte)((i % 255) + 1);
+        }
+        block[sepPos] = 0x00;
+        System.arraycopy(plaintext, 0, block, sepPos + 1, plaintext.length);
+
+        return block;
+    }
+
+    /*
+     * CVE-2024-30171 (Marvin): a PKCS#1 v1.5 encoding with fewer than 8 padding bytes must not be
+     * accepted when decrypting with an expected plaintext length.
+     */
+    private void testPKCS1FixedLengthShortPadding(RSAKeyParameters pubParameters, RSAKeyParameters privParameters)
+        throws Exception
+    {
+        AsymmetricBlockCipher rawEng = new RSAEngine();
+        rawEng.init(true, pubParameters);
+
+        int blockSize = rawEng.getInputBlockSize();
+
+        // only 7 bytes of padding
+        byte[] plaintext = new byte[blockSize - 1 - 8];
+        for (int i = 0; i < plaintext.length; i++)
+        {
+            plaintext[i] = (byte)i;
+        }
+
+        byte[] block = createType2Block(blockSize, plaintext);
+        byte[] encrypted = rawEng.processBlock(block, 0, block.length);
+
+        byte[] fallback = new byte[plaintext.length];
+        Arrays.fill(fallback, (byte)0xA5);
+
+        PKCS1Encoding fEng = new PKCS1Encoding(new RSAEngine(), fallback);
+        fEng.init(false, privParameters);
+
+        byte[] decrypted = fEng.processBlock(encrypted, 0, encrypted.length);
+        isTrue("short PKCS1 padding accepted in fixed length (fallback) mode", Arrays.areEqual(fallback, decrypted));
+
+        fEng = new PKCS1Encoding(new RSAEngine(), plaintext.length);
+        fEng.init(false, new ParametersWithRandom(privParameters, new SecureRandom()));
+
+        decrypted = fEng.processBlock(encrypted, 0, encrypted.length);
+        isTrue("fixed length PKCS1 output length wrong", decrypted.length == plaintext.length);
+        isTrue("short PKCS1 padding accepted in fixed length mode", !Arrays.areEqual(plaintext, decrypted));
+
+        PKCS1Encoding eng = new PKCS1Encoding(new RSAEngine());
+        eng.init(false, privParameters);
+
+        try
+        {
+            eng.processBlock(encrypted, 0, encrypted.length);
+
+            fail("short PKCS1 padding accepted");
+        }
+        catch (InvalidCipherTextException e)
+        {
+            isEquals("block incorrect", e.getMessage());
+        }
+
+        // exactly 8 bytes of padding is the minimum valid encoding
+        plaintext = new byte[blockSize - 1 - 9];
+        for (int i = 0; i < plaintext.length; i++)
+        {
+            plaintext[i] = (byte)i;
+        }
+
+        block = createType2Block(blockSize, plaintext);
+        encrypted = rawEng.processBlock(block, 0, block.length);
+
+        fEng = new PKCS1Encoding(new RSAEngine(), plaintext.length);
+        fEng.init(false, new ParametersWithRandom(privParameters, new SecureRandom()));
+
+        decrypted = fEng.processBlock(encrypted, 0, encrypted.length);
+        isTrue("minimum PKCS1 padding rejected in fixed length mode", Arrays.areEqual(plaintext, decrypted));
+
+        decrypted = eng.processBlock(encrypted, 0, encrypted.length);
+        isTrue("minimum PKCS1 padding rejected", Arrays.areEqual(plaintext, decrypted));
+    }
+
+    private void checkTlsRsaImplicitRejection(String label, byte[] encrypted, RSAKeyParameters privParameters,
+        int protocolVersion, byte[] unexpected)
+    {
+        byte[] decrypted;
+        try
+        {
+            decrypted = TlsRsaKeyExchange.decryptPreMasterSecret(encrypted, 0, encrypted.length, privParameters,
+                protocolVersion, new SecureRandom());
+        }
+        catch (Exception e)
+        {
+            fail("TLS RSA " + label + ": unexpected exception " + e.toString(), e);
+            return;
+        }
+
+        isTrue("TLS RSA " + label + ": wrong length",
+            decrypted.length == TlsRsaKeyExchange.PRE_MASTER_SECRET_LENGTH);
+        isTrue("TLS RSA " + label + ": not rejected", !Arrays.areEqual(unexpected, decrypted));
+    }
+
+    /*
+     * CVE-2024-30171 (Marvin): TLS RSA premaster secret decryption must never signal a padding or
+     * version failure, it must return a random premaster secret instead.
+     */
+    private void testTlsRsaKeyExchange(RSAKeyParameters pubParameters, RSAKeyParameters privParameters)
+        throws Exception
+    {
+        SecureRandom random = new SecureRandom();
+        int protocolVersion = 0x0303;
+        int pmsLength = TlsRsaKeyExchange.PRE_MASTER_SECRET_LENGTH;
+
+        isTrue("TLS RSA premaster secret length wrong", pmsLength == 48);
+        isTrue("TLS RSA input limit wrong",
+            TlsRsaKeyExchange.getInputLimit(privParameters) == (mod.bitLength() + 7) / 8);
+
+        byte[] preMasterSecret = new byte[pmsLength];
+        random.nextBytes(preMasterSecret);
+        preMasterSecret[0] = (byte)(protocolVersion >>> 8);
+        preMasterSecret[1] = (byte)protocolVersion;
+
+        AsymmetricBlockCipher eng = new PKCS1Encoding(new RSAEngine());
+        eng.init(true, new ParametersWithRandom(pubParameters, random));
+
+        byte[] encrypted = eng.processBlock(preMasterSecret, 0, preMasterSecret.length);
+
+        // valid encryption, CRT private key
+        byte[] decrypted = TlsRsaKeyExchange.decryptPreMasterSecret(encrypted, 0, encrypted.length, privParameters,
+            protocolVersion, random);
+        isTrue("TLS RSA premaster secret decryption failed (CRT)", Arrays.areEqual(preMasterSecret, decrypted));
+
+        // valid encryption, non-CRT private key and default randomness
+        RSAKeyParameters nonCrtPrivParameters = new RSAKeyParameters(true, mod, privExp);
+        decrypted = TlsRsaKeyExchange.decryptPreMasterSecret(encrypted, 0, encrypted.length, nonCrtPrivParameters,
+            protocolVersion, null);
+        isTrue("TLS RSA premaster secret decryption failed (non-CRT)", Arrays.areEqual(preMasterSecret, decrypted));
+
+        // valid encryption at an offset
+        byte[] offsetInput = new byte[encrypted.length + 7];
+        System.arraycopy(encrypted, 0, offsetInput, 7, encrypted.length);
+        decrypted = TlsRsaKeyExchange.decryptPreMasterSecret(offsetInput, 7, encrypted.length, privParameters,
+            protocolVersion, random);
+        isTrue("TLS RSA premaster secret decryption failed (offset)", Arrays.areEqual(preMasterSecret, decrypted));
+
+        // version mismatch
+        checkTlsRsaImplicitRejection("version mismatch", encrypted, privParameters, 0x0302, preMasterSecret);
+        checkTlsRsaImplicitRejection("version mismatch (non-CRT)", encrypted, nonCrtPrivParameters, 0x0301,
+            preMasterSecret);
+
+        // corrupted ciphertext
+        byte[] corrupted = Arrays.clone(encrypted);
+        corrupted[corrupted.length / 2] ^= 0x01;
+        checkTlsRsaImplicitRejection("corrupted ciphertext", corrupted, privParameters, protocolVersion,
+            preMasterSecret);
+
+        // ciphertext not less than the modulus
+        byte[] outOfRange = new byte[TlsRsaKeyExchange.getInputLimit(privParameters)];
+        Arrays.fill(outOfRange, (byte)0xFF);
+        checkTlsRsaImplicitRejection("ciphertext out of range", outOfRange, privParameters, protocolVersion,
+            preMasterSecret);
+
+        // malformed PKCS#1 v1.5 encodings carrying the premaster secret
+        AsymmetricBlockCipher rawEng = new RSAEngine();
+        rawEng.init(true, pubParameters);
+
+        int blockSize = rawEng.getInputBlockSize();
+        int sepPos = blockSize - 1 - pmsLength;
+
+        byte[] block = createType2Block(blockSize, preMasterSecret);
+        byte[] rawEncrypted = rawEng.processBlock(block, 0, block.length);
+        decrypted = TlsRsaKeyExchange.decryptPreMasterSecret(rawEncrypted, 0, rawEncrypted.length, privParameters,
+            protocolVersion, random);
+        isTrue("TLS RSA premaster secret decryption failed (raw block)", Arrays.areEqual(preMasterSecret, decrypted));
+
+        block = createType2Block(blockSize, preMasterSecret);
+        block[0] = 0x01;
+        checkTlsRsaImplicitRejection("wrong block type", rawEng.processBlock(block, 0, block.length), privParameters,
+            protocolVersion, preMasterSecret);
+
+        block = createType2Block(blockSize, preMasterSecret);
+        block[sepPos / 2] = 0x00;
+        checkTlsRsaImplicitRejection("zero byte in padding", rawEng.processBlock(block, 0, block.length),
+            privParameters, protocolVersion, preMasterSecret);
+
+        block = createType2Block(blockSize, preMasterSecret);
+        block[sepPos] = 0x5A;
+        checkTlsRsaImplicitRejection("missing separator", rawEng.processBlock(block, 0, block.length),
+            privParameters, protocolVersion, preMasterSecret);
+
+        block = createType2Block(blockSize, Arrays.copyOfRange(preMasterSecret, 0, pmsLength - 1));
+        checkTlsRsaImplicitRejection("short premaster secret", rawEng.processBlock(block, 0, block.length),
+            privParameters, protocolVersion, Arrays.copyOfRange(block, blockSize - pmsLength, blockSize));
+
+        block = createType2Block(blockSize, Arrays.concatenate(preMasterSecret, new byte[]{ 0x03 }));
+        checkTlsRsaImplicitRejection("long premaster secret", rawEng.processBlock(block, 0, block.length),
+            privParameters, protocolVersion, Arrays.copyOfRange(block, blockSize - pmsLength, blockSize));
+
+        // argument checks
+        try
+        {
+            TlsRsaKeyExchange.decryptPreMasterSecret(encrypted, 0, encrypted.length, pubParameters, protocolVersion,
+                random);
+            fail("TLS RSA public key accepted");
+        }
+        catch (IllegalArgumentException e)
+        {
+            isEquals("'privateKey' must be an RSA private key", e.getMessage());
+        }
+
+        try
+        {
+            TlsRsaKeyExchange.decryptPreMasterSecret(encrypted, 0, encrypted.length, privParameters, 0x10000, random);
+            fail("TLS RSA invalid protocol version accepted");
+        }
+        catch (IllegalArgumentException e)
+        {
+            isEquals("'protocolVersion' must be a 16 bit value", e.getMessage());
+        }
+
+        try
+        {
+            byte[] tooLong = new byte[TlsRsaKeyExchange.getInputLimit(privParameters) + 1];
+            TlsRsaKeyExchange.decryptPreMasterSecret(tooLong, 0, tooLong.length, privParameters, protocolVersion,
+                random);
+            fail("TLS RSA oversized input accepted");
+        }
+        catch (IllegalArgumentException e)
+        {
+            isEquals("input not a valid EncryptedPreMasterSecret", e.getMessage());
+        }
+
+        try
+        {
+            TlsRsaKeyExchange.decryptPreMasterSecret(encrypted, 1, encrypted.length, privParameters, protocolVersion,
+                random);
+            fail("TLS RSA input bounds not checked");
+        }
+        catch (IllegalArgumentException e)
+        {
+            isEquals("input not a valid EncryptedPreMasterSecret", e.getMessage());
+        }
+    }
+
     public void performTest()
+        throws Exception
     {
         RSAKeyParameters pubParameters = new RSAKeyParameters(false, mod, pubExp);
         RSAKeyParameters privParameters = new RSAPrivateCrtKeyParameters(mod, pubExp, privExp, p, q, pExp, qExp, crtCoef);
@@ -698,6 +954,8 @@ public class RSATest
         testWrongPaddingPKCS1Block(pubParameters, privParameters);
         test_CVE_2017_15361();
         testUnsafeModulusAndWrongExp();
+        testPKCS1FixedLengthShortPadding(pubParameters, privParameters);
+        testTlsRsaKeyExchange(pubParameters, privParameters);
 
         try
         {
