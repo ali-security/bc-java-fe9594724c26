@@ -922,6 +922,7 @@
              <fileset dir="${src.dir}" includes="**/crypto/*/*Test.java" />
              <fileset dir="${src.dir}" includes="**/tsp/*UnitTest.java" />
              <fileset dir="${src.dir}" includes="**/utiltest/*Test.java" />
+             <fileset dir="${src.dir}" includes="**/pqc/crypto/lms/*.java" />
              <fileset dir="${src.dir}" includes="**/util/io/pem/*Test.java" />
              <fileset dir="${src.dir}" includes="**/test/*.java" />
              <fileset dir="${src.dir}" includes="**/test/*/*.java" />
@@ -952,7 +953,6 @@
              <fileset dir="${src.dir}" includes="**/*.message" />
         </copy>
 
-        <delete file="${test.target.src.dir}/org/bouncycastle/pqc/crypto/lms/AllTests.java" />
         <delete file="${test.target.src.dir}/org/bouncycastle/x509/CertPathReviewerMessages_de.properties" />
         <delete file="${test.target.src.dir}/org/bouncycastle/x509/CertPathReviewerMessages.properties" />
 
@@ -995,7 +995,8 @@
             <formatter type="xml" />
             <batchtest todir="${artifacts.reports.xml.dir}" unless="testcase">
                 <fileset dir="${test.target.src.dir}">
-                    <include name="**/AllTests.java" />
+                    <include name="**/AllTests.java" unless="env.JUNIT_INCLUDE_TESTS" />
+                    <include name="${env.JUNIT_INCLUDE_TESTS}" if="env.JUNIT_INCLUDE_TESTS" />
                     <exclude name="${env.JUNIT_EXCLUDE_TESTS}" if="env.JUNIT_EXCLUDE_TESTS" />
                 </fileset>
             </batchtest>

@@ -1,0 +1,73 @@
+name: seal-build
+
+# Builds the bcprov-jdk18on release jar the way the public one was made:
+# ant/jdk18+.xml build-provider (Ant 1.6.5, JDK 8u362, release.debug=false),
+# pack200 --repack (upstream's pack200.enabled packJar step), the
+# META-INF/services merge that build1-8+ performs, then upstream's
+# add_module.sh prov for the Java 9/11/15 multi-release layers.
+# Tests run on Travis (.travis.yml).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JDK 9, 11 and 15 for add_module.sh
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          cache: gradle
+          java-version: |
+            9
+            11
+            15
+
+      - name: Install JDK 8u362 and Ant 1.6.5
+        run: |
+          mkdir -p "$HOME/seal-tools/bin"
+          curl -fsSL https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u362-b09/OpenJDK8U-jdk_x64_linux_hotspot_8u362b09.tar.gz | tar xz -C "$HOME/seal-tools"
+          curl -fsSL https://archive.apache.org/dist/ant/binaries/apache-ant-1.6.5-bin.tar.gz | tar xz -C "$HOME/seal-tools"
+          # add_module.sh locates its JDKs through openjdk_9 / openjdk_11 / openjdk_15 commands
+          for v in 9 11 15; do
+            eval "home=\$JAVA_HOME_${v}_X64"
+            printf '#!/bin/sh\necho %s\n' "$home" > "$HOME/seal-tools/bin/openjdk_$v"
+            chmod +x "$HOME/seal-tools/bin/openjdk_$v"
+          done
+          # the runner exports ANT_HOME for its preinstalled Ant, which the 1.6.5 launcher would obey
+          echo "ANT_HOME=$HOME/seal-tools/apache-ant-1.6.5" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$HOME/seal-tools/jdk8u362-b09" >> "$GITHUB_ENV"
+          echo "$HOME/seal-tools/bin" >> "$GITHUB_PATH"
+          echo "$HOME/seal-tools/jdk8u362-b09/bin" >> "$GITHUB_PATH"
+          echo "$HOME/seal-tools/apache-ant-1.6.5/bin" >> "$GITHUB_PATH"
+
+      - name: Build provider jar
+        run: |
+          java -version
+          ant -version
+          ant -Drelease.debug=false -f ant/jdk18+.xml build-provider
+
+      - name: Repack and add provider services
+        run: |
+          (cd build/artifacts/jdk1.8/jars && ls -l && pack200 --repack --segment-limit=-1 bcprov-jdk18on-176.jar)
+          tar cf - prov/src/main/resources/META-INF | (cd build/artifacts/jdk1.8/jars/; tar xf -)
+          cd build/artifacts/jdk1.8/jars/
+          mv prov/src/main/resources/META-INF .
+          jar uf bcprov-jdk18on-176.jar META-INF
+          rm -r prov META-INF
+
+      - name: Add multi-release layers
+        run: |
+          sh add_module.sh prov
+          mkdir -p seal-dist
+          cp build/artifacts/jdk1.8/jars/bcprov-jdk18on-176.jar seal-dist/bcprov-jdk18on-1.76.jar
+          unzip -l seal-dist/bcprov-jdk18on-1.76.jar | tail -n 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcprov-jdk18on
+          path: seal-dist/bcprov-jdk18on-1.76.jar
+          if-no-files-found: error
