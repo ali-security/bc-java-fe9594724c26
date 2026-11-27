@@ -2,6 +2,10 @@ package org.bouncycastle.jce.provider.test.nist;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.math.BigInteger;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
 import java.security.Security;
 import java.security.cert.CertPath;
 import java.security.cert.CertStore;
@@ -24,17 +28,24 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
 
+import javax.security.auth.x500.X500Principal;
+
 import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
 import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1Primitive;
+import org.bouncycastle.asn1.x509.BasicConstraints;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
+import org.bouncycastle.asn1.x509.GeneralNames;
 import org.bouncycastle.asn1.x509.X509Extension;
 import org.bouncycastle.i18n.ErrorBundle;
 import org.bouncycastle.test.PrintTestResult;
 import org.bouncycastle.test.TestResourceFinder;
 import org.bouncycastle.util.encoders.Base64;
 import org.bouncycastle.x509.PKIXCertPathReviewer;
+import org.bouncycastle.x509.X509V3CertificateGenerator;
 import org.bouncycastle.x509.extension.X509ExtensionUtil;
 
 /**
@@ -530,6 +541,87 @@ public class NistCertPathReviewerTest
                 new String[] { "InvalidDNSnameConstraintsTest31EE", "nameConstraintsDNS1CACert" },
                 new String[] { TRUST_ANCHOR_ROOT_CRL, "nameConstraintsDNS1CACRL" },
                 "CertPathReviewer.notPermittedEmail");
+    }
+
+    /**
+     * CVE-2025-8916: the reviewer must refuse a subject alternative name extension with more than
+     * 1024 names instead of checking each one against the name constraints.
+     */
+    public void testSubjectAltNameLimit()
+        throws Exception
+    {
+        KeyPairGenerator kpGen = KeyPairGenerator.getInstance("RSA", "BC");
+        kpGen.initialize(1024);
+        KeyPair rootKp = kpGen.generateKeyPair();
+        KeyPair caKp = kpGen.generateKeyPair();
+        KeyPair eeKp = kpGen.generateKeyPair();
+
+        // names on the intermediate CA certificate (path index 1)
+        assertFalse(hasSubjAltNameError(rootKp, caKp, eeKp, 1024, false));
+        assertTrue(hasSubjAltNameError(rootKp, caKp, eeKp, 1025, false));
+
+        // names on the end-entity certificate (path index 0)
+        assertFalse(hasSubjAltNameError(rootKp, caKp, eeKp, 1024, true));
+        assertTrue(hasSubjAltNameError(rootKp, caKp, eeKp, 1025, true));
+    }
+
+    private static X509Certificate makeCert(String issuer, String subject, KeyPair subjectKp, PrivateKey signer,
+        int serial, int pathLen, GeneralName[] altNames)
+        throws Exception
+    {
+        long now = System.currentTimeMillis();
+        X509V3CertificateGenerator gen = new X509V3CertificateGenerator();
+        gen.setSerialNumber(BigInteger.valueOf(serial));
+        gen.setIssuerDN(new X500Principal(issuer));
+        gen.setSubjectDN(new X500Principal(subject));
+        gen.setNotBefore(new Date(now - 60000L));
+        gen.setNotAfter(new Date(now + 86400000L));
+        gen.setPublicKey(subjectKp.getPublic());
+        gen.setSignatureAlgorithm("SHA256withRSA");
+        if (pathLen >= 0)
+        {
+            gen.addExtension(Extension.basicConstraints, true, new BasicConstraints(pathLen));
+        }
+        if (altNames != null)
+        {
+            gen.addExtension(Extension.subjectAlternativeName, false, new GeneralNames(altNames));
+        }
+        return gen.generate(signer, "BC");
+    }
+
+    private boolean hasSubjAltNameError(KeyPair rootKp, KeyPair caKp, KeyPair eeKp, int nameCount, boolean onEndEntity)
+        throws Exception
+    {
+        GeneralName[] names = new GeneralName[nameCount];
+        for (int i = 0; i != nameCount; i++)
+        {
+            names[i] = new GeneralName(GeneralName.dNSName, "host" + i + ".example.com");
+        }
+
+        X509Certificate rootCert = makeCert("CN=Name Limit Root", "CN=Name Limit Root", rootKp, rootKp.getPrivate(), 1, 1, null);
+        X509Certificate caCert = makeCert("CN=Name Limit Root", "CN=Name Limit CA", caKp, rootKp.getPrivate(), 2, 0,
+            onEndEntity ? null : names);
+        X509Certificate eeCert = makeCert("CN=Name Limit CA", "CN=Name Limit EE", eeKp, caKp.getPrivate(), 3, -1,
+            onEndEntity ? names : null);
+
+        List path = new ArrayList();
+        path.add(eeCert);
+        path.add(caCert);
+        CertPath certPath = CertificateFactory.getInstance("X.509", "BC").generateCertPath(path);
+        PKIXParameters params = new PKIXParameters(Collections.singleton(new TrustAnchor(rootCert, null)));
+        params.setRevocationEnabled(false);
+        PKIXCertPathReviewer reviewer = new PKIXCertPathReviewer(certPath, params);
+
+        List errors = reviewer.getErrors(onEndEntity ? 0 : 1);
+        for (int i = 0; i != errors.size(); i++)
+        {
+            if ("CertPathReviewer.subjAltNameExtError".equals(((ErrorBundle)errors.get(i)).getId()))
+            {
+                assertFalse(reviewer.isValidCertPath());
+                return true;
+            }
+        }
+        return false;
     }
 
     private void doNameConstraintErrorTest(
