@@ -1,7 +1,10 @@
 package org.bouncycastle.pqc.crypto.lms;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.security.SecureRandom;
@@ -9,8 +12,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 import junit.framework.TestCase;
+import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
+import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.crypto.prng.FixedSecureRandom;
 import org.bouncycastle.pqc.crypto.ExhaustedPrivateKeyException;
+import org.bouncycastle.pqc.crypto.util.PublicKeyFactory;
 import org.bouncycastle.test.TestResourceFinder;
 import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.Pack;
@@ -106,6 +114,111 @@ public class HSSTests
         assertTrue("Test Case 2 Signature 2", LMS.verifySignature(lmsPub, lmsSignature, message));
 
     }
+
+    /**
+     * An encoded HSS signature must be consumed exactly, trailing data is rejected.
+     */
+    public void testHSSSignatureTrailingDataRejected()
+        throws Exception
+    {
+        HSSPrivateKeyParameters privKey = HSS.generateHSSKeyPair(
+            new HSSKeyGenerationParameters(new LMSParameters[]{
+                new LMSParameters(LMSigParameters.lms_sha256_n32_h5, LMOtsParameters.sha256_n32_w8),
+                new LMSParameters(LMSigParameters.lms_sha256_n32_h5, LMOtsParameters.sha256_n32_w8),
+            }, new SecureRandom())
+        );
+        HSSPublicKeyParameters pubKey = privKey.getPublicKey();
+        byte[] message = Hex.decode("ABCDEF");
+
+        byte[] sigEnc = HSS.generateSignature(privKey, message).getEncoded();
+
+        HSSSignature sig = HSSSignature.getInstance(sigEnc, pubKey.getL());
+        assertTrue(HSS.verifySignature(pubKey, sig, message));
+
+        byte[] trailing = Arrays.append(sigEnc, (byte)0);
+        try
+        {
+            HSSSignature.getInstance(trailing, pubKey.getL());
+            fail("trailing data after HSS signature accepted");
+        }
+        catch (IOException e)
+        {
+            assertEquals("unexpected data found after HSS signature", e.getMessage());
+        }
+
+        HSSSigner signer = new HSSSigner();
+        signer.init(false, pubKey);
+        assertTrue(signer.verifySignature(message, sigEnc));
+        try
+        {
+            signer.verifySignature(message, trailing);
+            fail("trailing data after HSS signature accepted");
+        }
+        catch (IllegalStateException e)
+        {
+            assertEquals("unable to decode signature: unexpected data found after HSS signature", e.getMessage());
+        }
+    }
+
+    /**
+     * A public key carrying an attacker chosen level count L must be rejected when it is
+     * parsed, otherwise a matching signature (Nspk = L - 1) drives an allocation of
+     * L - 1 signed public key slots before any data is read.
+     */
+    public void testHSSPublicKeyExcessiveLevelCountRejected()
+        throws Exception
+    {
+        byte[] lmsPub = Composer.compose()
+            .u32str(LMSigParameters.lms_sha256_n32_h5.getType())
+            .u32str(LMOtsParameters.sha256_n32_w8.getType())
+            .bytes(new byte[16])
+            .bytes(new byte[32])
+            .build();
+
+        int[] hugeL = new int[]{ Integer.MAX_VALUE, Integer.MAX_VALUE - 1, 0x10000, Integer.MIN_VALUE };
+        for (int i = 0; i != hugeL.length; i++)
+        {
+            int l = hugeL[i];
+            byte[] pubEnc = Composer.compose().u32str(l).bytes(lmsPub).build();
+
+            // byte[] entry point
+            try
+            {
+                HSSPublicKeyParameters.getInstance(pubEnc);
+                fail("HSS L value " + l + " accepted");
+            }
+            catch (IOException e)
+            {
+                assertEquals("L value of HSS public key out of range: " + l, e.getMessage());
+            }
+
+            // stream entry point
+            try
+            {
+                HSSPublicKeyParameters.getInstance(new DataInputStream(new ByteArrayInputStream(pubEnc)));
+                fail("HSS L value " + l + " accepted");
+            }
+            catch (IOException e)
+            {
+                assertEquals("L value of HSS public key out of range: " + l, e.getMessage());
+            }
+
+            // X.509 SubjectPublicKeyInfo entry point (OCTET STRING wrapped, as produced
+            // by SubjectPublicKeyInfoFactory and expected by PublicKeyFactory)
+            SubjectPublicKeyInfo keyInfo = new SubjectPublicKeyInfo(
+                new AlgorithmIdentifier(PKCSObjectIdentifiers.id_alg_hss_lms_hashsig), new DEROctetString(pubEnc));
+            try
+            {
+                PublicKeyFactory.createKey(keyInfo);
+                fail("HSS L value " + l + " accepted");
+            }
+            catch (IOException e)
+            {
+                assertEquals("L value of HSS public key out of range: " + l, e.getMessage());
+            }
+        }
+    }
+
 
 
     private ArrayList<byte[]> loadVector(String vector)
