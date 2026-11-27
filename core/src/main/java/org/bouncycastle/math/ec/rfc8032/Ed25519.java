@@ -563,7 +563,12 @@ public abstract class Ed25519
 
         int[] v0 = new int[4];
         int[] v1 = new int[4];
-        Scalar25519.reduceBasisVar(nA, v0, v1);
+
+        if (!Scalar25519.reduceBasisVar(nA, v0, v1))
+        {
+            throw new IllegalStateException();
+        }
+
         Scalar25519.multiply128Var(nS, v1, nS);
 
         PointAccum pZ = new PointAccum();
@@ -625,7 +630,12 @@ public abstract class Ed25519
 
         int[] v0 = new int[4];
         int[] v1 = new int[4];
-        Scalar25519.reduceBasisVar(nA, v0, v1);
+
+        if (!Scalar25519.reduceBasisVar(nA, v0, v1))
+        {
+            throw new IllegalStateException();
+        }
+
         Scalar25519.multiply128Var(nS, v1, nS);
 
         PointAccum pZ = new PointAccum();
