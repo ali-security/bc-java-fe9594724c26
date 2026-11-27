@@ -845,6 +845,11 @@ public abstract class ECCurve
 
         private static FiniteField buildField(int m, int k1, int k2, int k3)
         {
+            if (m > Properties.asInteger("org.bouncycastle.ec.max_f2m_field_size", 1142))  // twice 571
+            {
+                throw new IllegalArgumentException("field size out of range: " + m);
+            }
+
             int[] exponents = (k2 | k3) == 0
                 ? new int[]{ 0, k1, m }
                 : new int[]{ 0, k1, k2, k3, m };
@@ -997,7 +1002,7 @@ public abstract class ECCurve
             }
 
             int m = this.getFieldSize();
-
+            
             // For odd m, use the half-trace 
             if (0 != (m & 1))
             {
