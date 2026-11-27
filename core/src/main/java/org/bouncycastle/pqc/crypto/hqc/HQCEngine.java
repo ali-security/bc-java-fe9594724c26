@@ -350,6 +350,26 @@ class HQCEngine
         System.arraycopy(m, 0, output, 0, output.length);
     }
 
+    /**
+     * Sample a vector of {@code weight} distinct set bits in [0, n) into {@code output}.
+     * <p>
+     * NOTE: this runs on secret data at all of its call sites - it samples the secret key
+     * supports x and y in {@link #genKeyPair}, re-expands them from the long-term secret key
+     * seed on every {@link #decaps}, where the same seed produces the same draw sequence every
+     * time and so any timing variation is a fixed, repeatedly measurable function of the private
+     * key, and it samples r1, r2 and e in {@link #encrypt}. Everything here is therefore
+     * branch-free and fixed-count: each candidate is reduced with a fixed-iteration constant-time
+     * remainder rather than the variable-latency {@code %} division, the duplicate scan visits
+     * every later slot and combines the comparisons as a mask rather than branching on a
+     * collision, a repeated position is replaced by masking, and the bit vector is assembled by
+     * masking across all words rather than by indexing with a secret position. Do not "optimise"
+     * any of that back into an {@code if}, a {@code break}, a {@code %} or a secret-indexed store.
+     * <p>
+     * The generator is read for exactly 4*weight bytes, as before, because two of these calls
+     * share one generator in {@link #genKeyPair} and three in {@link #encrypt} - consuming a
+     * different number of bytes, or producing a different support, would change the generated
+     * key or ciphertext.
+     */
     private void generateRandomFixedWeight(long[] output, KeccakRandomGenerator random, int weight)
     {
         int[] rand_u32 = new int[this.wr];
@@ -363,18 +383,16 @@ class HQCEngine
 
         for (int i = 0; i < weight; i++)
         {
-            support[i] = (int) (i + ((rand_u32[i]&0xFFFFFFFFL) % (n - i)));
+            support[i] = i + ctRemainder(rand_u32[i], n - i);
         }
 
         for (int i = (weight - 1); i >= 0; i--)
         {
+            // every later slot is compared, with no branch on the outcome of a comparison
             int found = 0;
             for (int j = i + 1; j < weight; j++)
             {
-                if (support[j] == support[i])
-                {
-                    found |= 1;
-                }
+                found |= compareU32(support[j], support[i]);
             }
 
             int mask = -found;
@@ -400,6 +418,35 @@ class HQCEngine
             }
             output[i] |= val;
         }
+    }
+
+    /**
+     * Constant-time equality for non-negative values: 1 if {@code v1 == v2}, 0 otherwise.
+     */
+    private static int compareU32(int v1, int v2)
+    {
+        return 1 ^ (((v1 - v2) | (v2 - v1)) >>> 31);
+    }
+
+    /**
+     * Constant-time {@code x mod d}, with {@code x} taken as an unsigned 32-bit value and
+     * {@code 0 < d < 2^31}. Restoring binary long division: a fixed 32 iterations, each with
+     * the conditional subtraction applied as a mask, so neither the running time nor the
+     * branches taken depend on {@code x} - unlike {@code %}, which compiles to a hardware
+     * division whose latency varies with its operands on common CPUs.
+     */
+    private static int ctRemainder(int x, int d)
+    {
+        long r = 0;
+        for (int b = 31; b >= 0; --b)
+        {
+            r = (r << 1) | ((x >>> b) & 1);
+            long t = r - d;
+            long m = t >> 63; // -1 if r < d, keep r; 0 if r >= d, take r - d
+            r = (r & m) | (t & ~m);
+        }
+
+        return (int)r;
     }
 
     void generatePublicKeyH(long[] out, KeccakRandomGenerator random)
