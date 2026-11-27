@@ -470,6 +470,51 @@ public class OpenSSHKeyParsingTests
         testRSA();
         testED25519();
         testFailures();
+        testEncryptedKeyRoundsBounded();
+    }
+
+    /**
+     * The bcrypt round count of an encrypted OpenSSH v1 private key is read from the key's own
+     * kdfoptions and, where encrypted keys are decrypted, drives the KDF before anything about the
+     * key has been verified - a round costs several milliseconds and the wire format allows up to
+     * 2^31-1 of them. This version of the parser does not decrypt OpenSSH keys at all, so the
+     * hostile round count must never reach a KDF: the key has to be refused up front.
+     * <p>
+     * The fixture is a normal ssh-keygen key (aes256-ctr, bcrypt, 16 rounds) with the round count
+     * rewritten to 2^31-1.
+     */
+    public void testEncryptedKeyRoundsBounded()
+        throws Exception
+    {
+        String pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+            "b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABD4XaoKXH\n" +
+            "N9dMM5dz+nRBC6AAAAEAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIHs3/Bh5SIn8aexd\n" +
+            "42KtdGV83J4+sckvemTmsG0u6uOyAAAAkBLLK8FUZ0ErL2dC/3fDEz+MdA6MMVZv0Q83OJ\n" +
+            "5AbQ0WvN0wLo6lARyiiZm2L4Z3rO5XGkY+BpDrNUI1iKNd39VdgyBLX+u0dbJ/EI5ZXMYs\n" +
+            "j5iVU+CD0fJc7KrToTDvblDoS3jeW9yXrLdnV5Mi25gdQLojq8x3px2Dv+HoqT3vTuAivl\n" +
+            "ISNUnmozjANHauJg==\n" +
+            "-----END OPENSSH PRIVATE KEY-----\n";
+
+        byte[] blob = new PemReader(new StringReader(pem)).readPemObject().getContent();
+
+        // the uint32 rounds field follows the 16 byte bcrypt salt in kdfoptions
+        isEquals("unexpected fixture rounds", 16, ((blob[63] & 0xff) << 24) | ((blob[64] & 0xff) << 16)
+            | ((blob[65] & 0xff) << 8) | (blob[66] & 0xff));
+        blob[63] = (byte)0x7f;
+        blob[64] = (byte)0xff;
+        blob[65] = (byte)0xff;
+        blob[66] = (byte)0xff;
+
+        try
+        {
+            OpenSSHPrivateKeyUtil.parsePrivateKeyBlob(blob);
+            fail("encrypted key with hostile bcrypt round count accepted");
+        }
+        catch (IllegalStateException e)
+        {
+            isEquals("unexpected message", "encrypted keys not supported", e.getMessage());
+        }
     }
 
     public void testRSA()

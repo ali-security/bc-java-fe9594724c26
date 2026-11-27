@@ -51,6 +51,28 @@ public class Properties
     public static final String BCFKS_MAX_SCRYPT_MEMORY = "org.bouncycastle.bcfks.max_scrypt_memory";
 
     /**
+     * Upper bound on the PBKDF2 iteration count honoured when BC takes that count from an
+     * untrusted encoding: verifying an RFC 9579 PBMAC1, and the raw JCA PBKDF2 provider (both the
+     * {@code SecretKeyFactory} derivation - which is what decrypting a PBES2-protected PKCS#8 /
+     * PEM private key or PKCS#12 bag uses - and the {@code AlgorithmParameters} parse a
+     * {@code Cipher} performs for PBES2). In each case the key-derivation parameters travel inside
+     * an unauthenticated container, so an unbounded count makes processing attacker-supplied
+     * material a CPU-exhaustion vector. Default 10,000,000 - the count RFC 8018 sec. 4.2 names as
+     * possibly appropriate for especially critical keys, so generous enough for deliberately
+     * strong settings. Read via {@link #asInteger(String, int)}.
+     */
+    public static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+
+    /**
+     * Upper bound, in bytes, on the scrypt working memory (~128 * N * r, and ~128 * p * r)
+     * honoured when decrypting a PBES2-protected PKCS#8 private key. As with
+     * {@link #PBE_MAX_ITERATION_COUNT} the scrypt cost travels in the unauthenticated container,
+     * so an unbounded cost is a memory-exhaustion vector. Default 1073741824 (1 GiB). Read via
+     * {@link #asInteger(String, int)}.
+     */
+    public static final String PBE_MAX_SCRYPT_MEMORY = "org.bouncycastle.pbe.max_scrypt_memory";
+
+    /**
      * Opt in to handling legacy version 0/1 BKS keystores. Those stores derive the HMAC integrity
      * key at only the digest size in bits (a 16-bit key for SHA-1; CVE-2018-5382), which is
      * brute-forceable offline, so by default the default {@code BKS} keystore type refuses to load
