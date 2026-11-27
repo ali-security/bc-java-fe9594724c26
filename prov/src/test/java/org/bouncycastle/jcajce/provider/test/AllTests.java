@@ -30,6 +30,7 @@ public class AllTests
         suite.addTestSuite(RFC3211WrapTest.class);
         suite.addTestSuite(SP80038GTest.class);
         suite.addTestSuite(BouncyCastleProviderTest.class);
+        suite.addTestSuite(CRLNestingDepthTest.class);
 
         return new BCTestSetup(suite);
     }
