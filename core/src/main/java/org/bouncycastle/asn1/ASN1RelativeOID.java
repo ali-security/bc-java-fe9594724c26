@@ -17,6 +17,17 @@ public class ASN1RelativeOID
         }
     };
 
+    /**
+     * Implementation limit on the length of the contents octets for a Relative OID.
+     * <p/>
+     * We adopt the same value used by OpenJDK for Object Identifier. In theory there is no limit on the
+     * length of the contents, or the number of subidentifiers, or the length of individual subidentifiers. In
+     * practice, supporting arbitrary lengths can lead to issues, e.g. denial-of-service attacks when
+     * attempting to convert a parsed value to its (decimal) string form.
+     */
+    private static final int MAX_CONTENTS_LENGTH = 4096;
+    private static final int MAX_IDENTIFIER_LENGTH = MAX_CONTENTS_LENGTH * 4 - 1;
+
     public static ASN1RelativeOID fromContents(byte[] contents)
     {
         return createPrimitive(contents, true);
@@ -64,25 +75,24 @@ public class ASN1RelativeOID
 
     public ASN1RelativeOID(String identifier)
     {
-        if (identifier == null)
-        {
-            throw new NullPointerException("'identifier' cannot be null");
-        }
-        if (!isValidIdentifier(identifier, 0))
-        {
-            throw new IllegalArgumentException("string " + identifier + " not a relative OID");
-        }
+        checkIdentifier(identifier);
 
+        byte[] contents = parseIdentifier(identifier);
+        checkContentsLength(contents.length);
+
+        this.contents = contents;
         this.identifier = identifier;
     }
 
     ASN1RelativeOID(ASN1RelativeOID oid, String branchID)
     {
-        if (!isValidIdentifier(branchID, 0))
-        {
-            throw new IllegalArgumentException("string " + branchID + " not a valid OID branch");
-        }
+        checkIdentifier(branchID);
 
+        byte[] stemContents = oid.getContents();
+        byte[] branchContents = parseIdentifier(branchID);
+        checkContentsLength(stemContents.length + branchContents.length);
+
+        this.contents = Arrays.concatenate(stemContents, branchContents);
         this.identifier = oid.getId() + "." + branchID;
     }
 
@@ -203,8 +213,9 @@ public class ASN1RelativeOID
         return false;
     }
 
-    private void doOutput(ByteArrayOutputStream aOut)
+    static byte[] parseIdentifier(String identifier)
     {
+        ByteArrayOutputStream aOut = new ByteArrayOutputStream();
         OIDTokenizer tok = new OIDTokenizer(identifier);
         while (tok.hasMoreTokens())
         {
@@ -218,24 +229,48 @@ public class ASN1RelativeOID
                 writeField(aOut, new BigInteger(token));
             }
         }
+
+        return aOut.toByteArray();
     }
 
     private synchronized byte[] getContents()
     {
         if (contents == null)
         {
-            ByteArrayOutputStream bOut = new ByteArrayOutputStream();
-
-            doOutput(bOut);
-
-            contents = bOut.toByteArray();
+            contents = parseIdentifier(identifier);
         }
 
         return contents;
     }
 
+    static void checkContentsLength(int contentsLength)
+    {
+        if (contentsLength > MAX_CONTENTS_LENGTH)
+        {
+            throw new IllegalArgumentException("exceeded relative OID contents length limit");
+        }
+    }
+
+    static void checkIdentifier(String identifier)
+    {
+        if (identifier == null)
+        {
+            throw new NullPointerException("'identifier' cannot be null");
+        }
+        if (identifier.length() > MAX_IDENTIFIER_LENGTH)
+        {
+            throw new IllegalArgumentException("exceeded relative OID contents length limit");
+        }
+        if (!isValidIdentifier(identifier, 0))
+        {
+            throw new IllegalArgumentException("string " + identifier + " not a valid relative OID");
+        }
+    }
+
     static ASN1RelativeOID createPrimitive(byte[] contents, boolean clone)
     {
+        checkContentsLength(contents.length);
+
         return new ASN1RelativeOID(contents, clone);
     }
 

@@ -22,6 +22,17 @@ public class ASN1ObjectIdentifier
         }
     };
 
+    /**
+     * Implementation limit on the length of the contents octets for an Object Identifier.
+     * <p/>
+     * We adopt the same value used by OpenJDK. In theory there is no limit on the length of the contents, or
+     * the number of subidentifiers, or the length of individual subidentifiers. In practice, supporting
+     * arbitrary lengths can lead to issues, e.g. denial-of-service attacks when attempting to convert a
+     * parsed value to its (decimal) string form.
+     */
+    private static final int MAX_CONTENTS_LENGTH = 4096;
+    private static final int MAX_IDENTIFIER_LENGTH = MAX_CONTENTS_LENGTH * 4 + 1;
+
     public static ASN1ObjectIdentifier fromContents(byte[] contents)
     {
         return createPrimitive(contents, true);
@@ -184,15 +195,12 @@ public class ASN1ObjectIdentifier
     public ASN1ObjectIdentifier(
         String identifier)
     {
-        if (identifier == null)
-        {
-            throw new NullPointerException("'identifier' cannot be null");
-        }
-        if (!isValidIdentifier(identifier))
-        {
-            throw new IllegalArgumentException("string " + identifier + " not an OID");
-        }
+        checkIdentifier(identifier);
 
+        byte[] contents = parseIdentifier(identifier);
+        checkContentsLength(contents.length);
+
+        this.contents = contents;
         this.identifier = identifier;
     }
 
@@ -204,11 +212,13 @@ public class ASN1ObjectIdentifier
      */
     ASN1ObjectIdentifier(ASN1ObjectIdentifier oid, String branchID)
     {
-        if (!ASN1RelativeOID.isValidIdentifier(branchID, 0))
-        {
-            throw new IllegalArgumentException("string " + branchID + " not a valid OID branch");
-        }
+        ASN1RelativeOID.checkIdentifier(branchID);
 
+        byte[] stemContents = oid.getContents();
+        byte[] branchContents = ASN1RelativeOID.parseIdentifier(branchID);
+        checkContentsLength(stemContents.length + branchContents.length);
+
+        this.contents = Arrays.concatenate(stemContents, branchContents);
         this.identifier = oid.getId() + "." + branchID;
     }
 
@@ -245,8 +255,9 @@ public class ASN1ObjectIdentifier
         return id.length() > stemId.length() && id.charAt(stemId.length()) == '.' && id.startsWith(stemId);
     }
 
-    private void doOutput(ByteArrayOutputStream aOut)
+    private static byte[] parseIdentifier(String identifier)
     {
+        ByteArrayOutputStream aOut = new ByteArrayOutputStream();
         OIDTokenizer tok = new OIDTokenizer(identifier);
         int first = Integer.parseInt(tok.nextToken()) * 40;
 
@@ -272,17 +283,15 @@ public class ASN1ObjectIdentifier
                 ASN1RelativeOID.writeField(aOut, new BigInteger(token));
             }
         }
+
+        return aOut.toByteArray();
     }
 
     private synchronized byte[] getContents()
     {
         if (contents == null)
         {
-            ByteArrayOutputStream bOut = new ByteArrayOutputStream();
-
-            doOutput(bOut);
-
-            contents = bOut.toByteArray();
+            contents = parseIdentifier(identifier);
         }
 
         return contents;
@@ -327,6 +336,30 @@ public class ASN1ObjectIdentifier
     public String toString()
     {
         return getId();
+    }
+
+    static void checkContentsLength(int contentsLength)
+    {
+        if (contentsLength > MAX_CONTENTS_LENGTH)
+        {
+            throw new IllegalArgumentException("exceeded OID contents length limit");
+        }
+    }
+
+    static void checkIdentifier(String identifier)
+    {
+        if (identifier == null)
+        {
+            throw new NullPointerException("'identifier' cannot be null");
+        }
+        if (identifier.length() > MAX_IDENTIFIER_LENGTH)
+        {
+            throw new IllegalArgumentException("exceeded OID contents length limit");
+        }
+        if (!isValidIdentifier(identifier))
+        {
+            throw new IllegalArgumentException("string " + identifier + " not a valid OID");
+        }
     }
 
     private static boolean isValidIdentifier(
@@ -407,6 +440,8 @@ public class ASN1ObjectIdentifier
 
     static ASN1ObjectIdentifier createPrimitive(byte[] contents, boolean clone)
     {
+        checkContentsLength(contents.length);
+
         final OidHandle hdl = new OidHandle(contents);
         ASN1ObjectIdentifier oid = pool.get(hdl);
         if (oid == null)
